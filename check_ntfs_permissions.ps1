@@ -9,11 +9,13 @@
       * Removed: Einträge, die der Parent vererben würde, am Child aber fehlen
       * Changed: gleiche Identität & Typ (Allow/Deny), aber andere Rechte
   - Erkennt deaktivierte Vererbung (AreAccessRulesProtected).
-  - Behandelt den Spezialfall: Vererbung deaktiviert, aber explizite ACEs am Child sind
+  - Spezialfall: Vererbung deaktiviert, aber explizite ACEs am Child sind
     inhaltlich identisch zu den vom Parent vererbbaren ACEs -> **keine Abweichung**.
+  - Thumbs.db wird vollständig ignoriert (kein Output, keine Warnungen).
 
 .NOTES
-  Autor: ChatGPT
+  Voraussetzung: PowerShell 5+ und Modul "NTFSSecurity"
+  Installation:  Install-Module NTFSSecurity
 #>
 
 # --- Modul laden ---
@@ -39,6 +41,13 @@ function As-Array {
     } else {
         return ,$InputObject
     }
+}
+
+function Test-SkipPath {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        return ([System.IO.Path]::GetFileName($Path) -ieq 'Thumbs.db')
+    } catch { return $false }
 }
 
 function Get-AclInfo {
@@ -92,12 +101,21 @@ function Compare-AclToParent {
     param(
         [Parameter(Mandatory)][string]$Path
     )
-    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-    $parentDir = Split-Path -Parent $item.FullName
-    if (-not $parentDir) { return $null }
 
-    $childInfo  = Get-AclInfo -Path $item.FullName
-    $parentInfo = Get-AclInfo -Path $parentDir
+    # Thumbs.db still überspringen
+    if (Test-SkipPath $Path) { return $null }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    } catch { return $null }
+
+    $parentDir = Split-Path -Parent $item.FullName
+    if (-not $parentDir -or (Test-SkipPath $parentDir)) { return $null }
+
+    try {
+        $childInfo  = Get-AclInfo -Path $item.FullName
+        $parentInfo = Get-AclInfo -Path $parentDir
+    } catch { return $null }
 
     # Vom Parent vererbbar (passend zum Child-Typ)
     $parentInheritable = Get-ParentInheritableAcesForChildType -ParentAces $parentInfo.AccessRules -ChildIsDirectory:$childInfo.IsDirectory
@@ -173,6 +191,8 @@ function Show-NtfsRights {
     param(
         [Parameter(Mandatory)][string]$Path
     )
+    if (Test-SkipPath $Path) { return }
+
     Write-Host ""
     Write-Host "=== Rechte für: $Path ===" -ForegroundColor Cyan
     try {
@@ -181,9 +201,13 @@ function Show-NtfsRights {
             Format-Table -AutoSize
     } catch {
         Write-Warning "Get-NTFSAccess fehlgeschlagen, nutze Get-Acl-Fallback: $($_.Exception.Message)"
-        (Get-Acl -LiteralPath $Path -ErrorAction Stop).Access |
-            Select-Object IdentityReference,AccessControlType,FileSystemRights,IsInherited,InheritanceFlags,PropagationFlags |
-            Format-Table -AutoSize
+        try {
+            (Get-Acl -LiteralPath $Path -ErrorAction Stop).Access |
+                Select-Object IdentityReference,AccessControlType,FileSystemRights,IsInherited,InheritanceFlags,PropagationFlags |
+                Format-Table -AutoSize
+        } catch {
+            # still schlucken, z. B. bei gelöschten/gesperrten Items
+        }
     }
 }
 
@@ -216,6 +240,9 @@ if ($mode -eq '2') {
 } else {
     $items = Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# Thumbs.db entfernen (still)
+$items = $items | Where-Object { $_.Name -ne 'Thumbs.db' }
 $items = $items | Sort-Object FullName
 
 Write-Host ""
@@ -259,7 +286,10 @@ foreach ($it in $items) {
             }
         }
     } catch {
-        Write-Warning "Fehler bei '$($it.FullName)': $($_.Exception.Message)"
+        if (-not (Test-SkipPath $it.FullName)) {
+            Write-Warning "Fehler bei '$($it.FullName)': $($_.Exception.Message)"
+        }
+        # Bei Thumbs.db oder gesperrten Pfaden still weitermachen
     }
 }
 
